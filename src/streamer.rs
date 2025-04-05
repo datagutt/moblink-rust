@@ -626,6 +626,11 @@ impl Relay {
             return Err("No streamer".into());
         };
         let streamer = streamer.lock().await;
+        if streamer.destination_address.is_empty() {
+            // TODO: Should not be an error, but start the tunnel when the
+            //       destination address is known (read from BelaUI).
+            return Err("Destination address not available".into());
+        }
         let start_tunnel = StartTunnelRequest {
             address: streamer.destination_address.clone(),
             port: streamer.destination_port,
