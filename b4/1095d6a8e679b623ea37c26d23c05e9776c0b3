@@ -1,0 +1,34 @@
+src/relay_service.rs
+  s_1fae81f750cf50::t_e2be083b64c6d0 111,117-186
+  s_1fae81f750cf50::t_c008da46931749 465-469,473,479
+  s_1fae81f750cf50::t_6008b164e5d5db 551
+  s_1fae81f750cf50::t_0b2eea76b4a93a 556-558,567-569
+  s_1fae81f750cf50::t_b7ec86494fb6ce 401-441,450
+  s_1fae81f750cf50::t_36e1e2ff0c1922 282-291,293
+  s_1fae81f750cf50::t_09f8f7aaf0df42 77
+  s_1fae81f750cf50::t_0ef02aee94eea9 81,95
+  s_1fae81f750cf50::t_9d1da4326afed2 16,187-188
+  s_1fae81f750cf50::t_8c6699ed23c937 229-231
+  s_1fae81f750cf50::t_5f7dd9b188f74f 244
+  s_1fae81f750cf50::t_0796adee69ecc5 249-251,264-266
+src/bin/relay_service.rs
+  s_1fae81f750cf50::t_bdbbb1df83f78e 25-40,84-86
+moblink-relay-service.json
+  s_1fae81f750cf50::t_2c59140a01bc5e 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "b41095d6a8e679b623ea37c26d23c05e9776c0b3",
+  "prompts": {},
+  "sessions": {
+    "s_1fae81f750cf50": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94056516-f50b-477c-9d5b-0e95e80d8029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
