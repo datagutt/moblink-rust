@@ -1,0 +1,19 @@
+.github/workflows/build-binaries.yml
+  s_99d73b3dca59b6::t_454bf3aab955a8 56,62,69,72,76,85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "b8182d7f297c702b5e68cd42b365e0794801eaca",
+  "prompts": {},
+  "sessions": {
+    "s_99d73b3dca59b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "30abba44-219d-459e-bba0-f90014bf5cb6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
