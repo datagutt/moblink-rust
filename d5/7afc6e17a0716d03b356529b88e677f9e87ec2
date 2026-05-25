@@ -1,0 +1,32 @@
+src/bin/relay_service.rs
+  s_1fae81f750cf50::t_1b9618c3d64ca0 6
+  s_1fae81f750cf50::t_8eb9329d3986a5 81-89
+src/streamer.rs
+  s_1fae81f750cf50::t_012648b149bacb 921,923
+  s_1fae81f750cf50::t_1fb387c5085592 694,696,700-708
+  s_1fae81f750cf50::t_6a5d76bbd34e30 657-674
+src/relay_service.rs
+  s_1fae81f750cf50::t_7a78f1a6a43d85 81,90,102-103,243,246,250,252-253,255-259,303,470,535-552,558,560
+README.md
+  s_1fae81f750cf50::t_94e956921a47be 81-111
+src/utils.rs
+  s_1fae81f750cf50::t_2969e944f8f38c 73-76
+src/bin/streamer.rs
+  s_1fae81f750cf50::t_ff177dc26f1d46 90-101
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "d57afc6e17a0716d03b356529b88e677f9e87ec2",
+  "prompts": {},
+  "sessions": {
+    "s_1fae81f750cf50": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94056516-f50b-477c-9d5b-0e95e80d8029",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
