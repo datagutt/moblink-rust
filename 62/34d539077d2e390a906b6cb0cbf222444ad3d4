@@ -1,0 +1,25 @@
+src/relay_service.rs
+  s_99d73b3dca59b6::t_b9facd5797d72a 355
+src/bin/relay.rs
+  s_99d73b3dca59b6::t_9a7dd9b2191bd0 133
+Cargo.toml
+  s_99d73b3dca59b6::t_7eba9fc5c7f4dc 31,33,41-44,52
+src/utils.rs
+  s_99d73b3dca59b6::t_c1eec09ef60079 67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "6234d539077d2e390a906b6cb0cbf222444ad3d4",
+  "prompts": {},
+  "sessions": {
+    "s_99d73b3dca59b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "30abba44-219d-459e-bba0-f90014bf5cb6",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
