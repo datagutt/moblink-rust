@@ -1,0 +1,19 @@
+src/relay.rs
+  s_b398e8980163ab::t_f4f79e0447d290 50,72,258-267,272-275,369-370,435-436,441,451-452,459-460,558,575-579,584-585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "2344897094adaca55fcc543fdb0dfc279a192240",
+  "prompts": {},
+  "sessions": {
+    "s_b398e8980163ab": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f39bd99b-583c-41d6-91d6-9176af054ecd",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "datagutt <datagutt@lekanger.no>"
+    }
+  }
+}
