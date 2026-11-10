@@ -214,64 +214,80 @@ impl RelayInner {
             let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
             let mut last_received = Instant::now();
             loop {
-                let result = tokio::select! {
-                    _ = tokio::time::sleep_until(last_received + Duration::from_secs(45)) => break,
-                    message = reader.next() => {
-                        let Some(result) = message else { break };
-                        last_received = Instant::now();
-                        result
-                    }
-                    _ = heartbeat.tick() => {
-                        let mut relay = relay_arc.lock().await;
-                        if generation != relay.websocket_generation || !relay.started {
-                            return;
+                // The deadline also covers mutex waits, handlers and socket writes.
+                let deadline = last_received + Duration::from_secs(45);
+                let keep_reading = tokio::time::timeout_at(deadline, async {
+                    let result = tokio::select! {
+                        message = reader.next() => {
+                            let Some(result) = message else { return false };
+                            last_received = Instant::now();
+                            result
                         }
-                        if !matches!(timeout(Duration::from_secs(5), relay.send_message(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) {
-                            break;
+                        _ = heartbeat.tick() => {
+                            let mut relay = relay_arc.lock().await;
+                            if generation != relay.websocket_generation || !relay.started {
+                                return false;
+                            }
+                            if relay.send_message(Message::Ping(Vec::new().into())).await.is_err() {
+                                return false;
+                            }
+                            return true;
                         }
-                        continue;
+                    };
+                    let mut relay = relay_arc.lock().await;
+                    if generation != relay.websocket_generation || !relay.started {
+                        return false;
                     }
-                };
-                let mut relay = relay_arc.lock().await;
-                if generation != relay.websocket_generation || !relay.started {
-                    return;
-                }
-                match result {
-                    Ok(message) => match message {
-                        Message::Text(text) => {
-                            match serde_json::from_str::<MessageToRelay>(&text) {
-                                Ok(message) => {
-                                    if let Err(error) = relay.handle_message(message).await {
-                                        error!("Message handling failed with error: {}", error);
-                                        break;
+                    match result {
+                        Ok(message) => match message {
+                            Message::Text(text) => {
+                                match serde_json::from_str::<MessageToRelay>(&text) {
+                                    Ok(message) => {
+                                        let result = timeout(
+                                            Duration::from_secs(5),
+                                            relay.handle_message(message),
+                                        )
+                                        .await
+                                        .unwrap_or_else(|error| Err(error.into()));
+                                        if let Err(error) = result {
+                                            error!("Message handling failed with error: {}", error);
+                                            return false;
+                                        }
+                                    }
+                                    _ => {
+                                        error!("Failed to deserialize message: {}", text);
                                     }
                                 }
-                                _ => {
-                                    error!("Failed to deserialize message: {}", text);
+                            }
+                            Message::Binary(data) => {
+                                debug!("Received binary message of length: {}", data.len());
+                            }
+                            Message::Ping(data) => {
+                                if relay.send_message(Message::Pong(data)).await.is_err() {
+                                    return false;
                                 }
                             }
+                            Message::Pong(_) => {
+                                debug!("Received pong message");
+                            }
+                            Message::Close(frame) => {
+                                info!("Received close message: {:?}", frame);
+                                return false;
+                            }
+                            Message::Frame(_) => {
+                                unreachable!("This is never used")
+                            }
+                        },
+                        Err(e) => {
+                            debug!("Error processing message: {}", e);
+                            return false;
                         }
-                        Message::Binary(data) => {
-                            debug!("Received binary message of length: {}", data.len());
-                        }
-                        Message::Ping(data) => {
-                            relay.send_message(Message::Pong(data)).await.ok();
-                        }
-                        Message::Pong(_) => {
-                            debug!("Received pong message");
-                        }
-                        Message::Close(frame) => {
-                            info!("Received close message: {:?}", frame);
-                            break;
-                        }
-                        Message::Frame(_) => {
-                            unreachable!("This is never used")
-                        }
-                    },
-                    Err(e) => {
-                        debug!("Error processing message: {}", e);
-                        break;
                     }
+                    true
+                })
+                .await;
+                if !matches!(keep_reading, Ok(true)) {
+                    break;
                 }
             }
             let mut relay = relay_arc.lock().await;
@@ -350,11 +366,12 @@ impl RelayInner {
         tokio::spawn(async move {
             sleep(Duration::from_secs(5)).await;
 
-            let should_start = *start_on_reconnect_soon.lock().await;
-            if should_start {
-                debug!("Reconnecting...");
-                if let Some(relay) = relay.upgrade() {
-                    relay.lock().await.start_internal().await;
+            if let Some(relay) = relay.upgrade() {
+                let mut relay = relay.lock().await;
+                let should_start = *start_on_reconnect_soon.lock().await;
+                if should_start {
+                    debug!("Reconnecting...");
+                    relay.start_internal().await;
                 }
             }
         });
@@ -533,7 +550,7 @@ impl RelayInner {
         let Some(writer) = self.ws_writer.as_mut() else {
             return Err("No websocket writer".into());
         };
-        writer.send(message).await?;
+        timeout(Duration::from_secs(5), writer.send(message)).await??;
         Ok(())
     }
 }
@@ -722,6 +739,88 @@ mod connection_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_retry_waiting_for_mutex_cannot_replace_session() {
+        let (relay, mut server, listener) = pair().await;
+        let mut inner = relay.inner.lock().await;
+        inner.reconnect_soon().await;
+        // The timer expires while stop/restart owns the mutex.
+        sleep(Duration::from_secs(6)).await;
+        inner.stop_internal().await;
+        let (_, replacement) = tokio::join!(inner.start_internal(), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        });
+        server.close(None).await.ok();
+        drop(inner);
+        let mut replacement = replacement;
+        identify(&mut replacement, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        assert!(
+            timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(relay.connection_status().connected);
+        relay.stop().await;
+    }
+
+    async fn stalled_status_pair() -> (Relay, WebSocketStream<TcpStream>, TcpListener) {
+        let (relay, mut server, listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        relay.inner.lock().await.get_status = Some(Arc::new(Box::new(move || {
+            let notify = notify.clone();
+            Box::pin(async move {
+                notify.notify_one();
+                std::future::pending().await
+            })
+        })));
+        let request = MessageToRelay::Request(MessageRequest {
+            id: 1,
+            data: MessageRequestData::Status(Present {}),
+        });
+        server
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        (relay, server, listener)
+    }
+
+    #[tokio::test]
+    async fn stalled_status_handler_disconnects_and_retries() {
+        let (relay, _server, listener) = stalled_status_pair().await;
+        timeout(Duration::from_secs(8), async {
+            while relay.connection_status().connected {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _replacement = timeout(Duration::from_secs(8), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        })
+        .await
+        .unwrap();
+        relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stop_is_bounded_while_status_handler_stalls() {
+        let (relay, _server, _listener) = stalled_status_pair().await;
+        timeout(Duration::from_secs(8), relay.stop()).await.unwrap();
+        assert!(!relay.connection_status().connected);
+        assert!(!relay.is_started().await);
+    }
+
+    #[tokio::test]
     async fn silent_peer_is_disconnected_by_heartbeat() {
         let (relay, mut server, _listener) = pair().await;
         identify(&mut server, MoblinkResult::Ok(Present {})).await;
@@ -849,7 +948,11 @@ pub fn create_get_status_closure(
         let status_file = status_file.clone();
         Box::pin(async move {
             let output = if let Some(status_executable) = &status_executable {
-                let Ok(output) = Command::new(status_executable).output().await else {
+                let Ok(output) = Command::new(status_executable)
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                else {
                     return Default::default();
                 };
                 output.stdout
