@@ -639,7 +639,9 @@ mod runtime_tests {
         assert_eq!(value["schema_version"], 2);
         assert_eq!(value["process_id"], std::process::id());
         assert!(value["updated_at"].as_u64().unwrap() > 0);
-        assert!(value["updated_uptime"].as_u64().unwrap() > 0);
+        // Uptime is optional on systems without /proc/uptime, including macOS.
+        let uptime = value.get("updated_uptime").unwrap();
+        assert!(uptime.is_null() || uptime.as_u64().is_some());
         assert_eq!(value["connected"], false);
         assert_eq!(value["relays"][0]["connected"], false);
         // Update authentication concurrently with repeated file snapshots.
