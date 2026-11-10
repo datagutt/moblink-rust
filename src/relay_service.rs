@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
@@ -234,7 +234,7 @@ struct RelayServiceInner {
     interface_name_overrides: HashMap<String, String>,
     runtime_status_file: Option<PathBuf>,
     get_status: Option<GetStatusClosure>,
-    status: Status,
+    status: watch::Sender<Status>,
     relays: Vec<ServiceRelay>,
     network_interfaces: Vec<NetworkInterface>,
     streamers: Vec<Streamer>,
@@ -264,7 +264,7 @@ impl RelayServiceInner {
                 ),
                 runtime_status_file: config.runtime_status_file,
                 get_status,
-                status: Default::default(),
+                status: watch::channel(Status::default()).0,
                 relays: Vec::new(),
                 network_interfaces: Vec::new(),
                 streamers: Vec::new(),
@@ -381,11 +381,12 @@ impl RelayServiceInner {
     }
 
     async fn update_status(&mut self) {
-        self.status = if let Some(get_status) = &self.get_status {
+        let status = if let Some(get_status) = &self.get_status {
             get_status().await
         } else {
             Status::default()
-        }
+        };
+        self.status.send_replace(status);
     }
 
     fn add_streamer(&mut self, name: String, address: Ipv4Addr, port: u16) {
@@ -524,16 +525,10 @@ impl RelayServiceInner {
     }
 
     pub fn create_get_status_closure(&self) -> Option<GetStatusClosure> {
-        let relay_service = self.me.clone();
+        let status = self.status.subscribe();
         Some(Box::new(move || {
-            let relay_service = relay_service.clone();
-            Box::pin(async move {
-                if let Some(relay_service) = relay_service.upgrade() {
-                    relay_service.lock().await.status.clone()
-                } else {
-                    Status::default()
-                }
-            })
+            let status = status.borrow().clone();
+            Box::pin(async move { status })
         }))
     }
 
@@ -620,6 +615,17 @@ mod runtime_tests {
         )
         .await;
         let mut inner = service.inner.lock().await;
+        let get_status = inner.create_get_status_closure().unwrap();
+        inner.status.send_replace(Status {
+            battery_percentage: Some(73),
+        });
+        // Connection setup may own this mutex for longer than the handler limit.
+        // Status must still return promptly, with the latest cached value.
+        let status = tokio::time::timeout(Duration::from_millis(100), get_status())
+            .await
+            .unwrap();
+        assert_eq!(status.battery_percentage, Some(73));
+
         inner.relays.push(ServiceRelay {
             interface_name: "eth0".into(),
             interface_address: Ipv4Addr::LOCALHOST,

@@ -214,26 +214,30 @@ impl RelayInner {
             let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
             let mut last_received = Instant::now();
             loop {
-                // The deadline also covers mutex waits, handlers and socket writes.
                 let deadline = last_received + Duration::from_secs(45);
-                let keep_reading = tokio::time::timeout_at(deadline, async {
-                    let result = tokio::select! {
-                        message = reader.next() => {
-                            let Some(result) = message else { return false };
-                            last_received = Instant::now();
-                            result
-                        }
-                        _ = heartbeat.tick() => {
+                let result = tokio::select! {
+                    message = tokio::time::timeout_at(deadline, reader.next()) => {
+                        let Ok(Some(result)) = message else { break };
+                        last_received = Instant::now();
+                        result
+                    }
+                    _ = heartbeat.tick() => {
+                        let sent = timeout(Duration::from_secs(5), async {
                             let mut relay = relay_arc.lock().await;
                             if generation != relay.websocket_generation || !relay.started {
                                 return false;
                             }
-                            if relay.send_message(Message::Ping(Vec::new().into())).await.is_err() {
-                                return false;
-                            }
-                            return true;
+                            relay.send_message(Message::Ping(Vec::new().into())).await.is_ok()
+                        }).await;
+                        if !matches!(sent, Ok(true)) {
+                            break;
                         }
-                    };
+                        continue;
+                    }
+                };
+                // A received frame gets a fresh processing budget, independent
+                // of the previous inactivity deadline, including mutex waits.
+                let keep_reading = timeout(Duration::from_secs(5), async {
                     let mut relay = relay_arc.lock().await;
                     if generation != relay.websocket_generation || !relay.started {
                         return false;
@@ -243,12 +247,7 @@ impl RelayInner {
                             Message::Text(text) => {
                                 match serde_json::from_str::<MessageToRelay>(&text) {
                                     Ok(message) => {
-                                        let result = timeout(
-                                            Duration::from_secs(5),
-                                            relay.handle_message(message),
-                                        )
-                                        .await
-                                        .unwrap_or_else(|error| Err(error.into()));
+                                        let result = relay.handle_message(message).await;
                                         if let Err(error) = result {
                                             error!("Message handling failed with error: {}", error);
                                             return false;
@@ -818,6 +817,50 @@ mod connection_tests {
         timeout(Duration::from_secs(8), relay.stop()).await.unwrap();
         assert!(!relay.connection_status().connected);
         assert!(!relay.is_started().await);
+    }
+
+    #[tokio::test]
+    async fn status_near_idle_deadline_gets_fresh_processing_budget() {
+        let (relay, mut server, _listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        relay.inner.lock().await.get_status = Some(Arc::new(Box::new(|| {
+            Box::pin(async {
+                sleep(Duration::from_secs(2)).await;
+                Status {
+                    battery_percentage: Some(73),
+                }
+            })
+        })));
+        // Leave pings unread so they cannot refresh the receive deadline.
+        sleep(Duration::from_secs(44)).await;
+        let request = MessageToRelay::Request(MessageRequest {
+            id: 42,
+            data: MessageRequestData::Status(Present {}),
+        });
+        server
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let response = timeout(Duration::from_secs(4), async {
+            loop {
+                if let Message::Text(text) = server.next().await.unwrap().unwrap() {
+                    break text;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["response"]["id"], 42);
+        assert_eq!(
+            response["response"]["data"]["status"]["batteryPercentage"],
+            73
+        );
+        assert!(relay.connection_status().connected);
+        relay.stop().await;
     }
 
     #[tokio::test]
