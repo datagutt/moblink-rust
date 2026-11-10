@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{error, info};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
@@ -11,13 +11,13 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
 
 use crate::MDNS_SERVICE_TYPE;
-use crate::relay::{GetStatusClosure, Relay, Status};
+use crate::relay::{ConnectionStatus, GetStatusClosure, Relay, Status};
 use crate::utils::{any_address_belongs_to_this_machine, get_first_ipv4_address};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -121,6 +121,8 @@ struct RuntimeStreamerStatus {
 
 #[derive(Serialize)]
 struct RuntimeRelayStatus {
+    #[serde(flatten)]
+    connection: ConnectionStatus,
     interface_name: String,
     interface_address: String,
     streamer_name: String,
@@ -130,6 +132,10 @@ struct RuntimeRelayStatus {
 
 #[derive(Serialize)]
 struct RuntimeStatus {
+    schema_version: u8,
+    process_id: u32,
+    updated_at: u64,
+    updated_uptime: Option<u64>,
     connected: bool,
     manual_streamer: bool,
     streamers: Vec<RuntimeStreamerStatus>,
@@ -228,7 +234,7 @@ struct RelayServiceInner {
     interface_name_overrides: HashMap<String, String>,
     runtime_status_file: Option<PathBuf>,
     get_status: Option<GetStatusClosure>,
-    status: Status,
+    status: watch::Sender<Status>,
     relays: Vec<ServiceRelay>,
     network_interfaces: Vec<NetworkInterface>,
     streamers: Vec<Streamer>,
@@ -258,7 +264,7 @@ impl RelayServiceInner {
                 ),
                 runtime_status_file: config.runtime_status_file,
                 get_status,
-                status: Default::default(),
+                status: watch::channel(Status::default()).0,
                 relays: Vec::new(),
                 network_interfaces: Vec::new(),
                 streamers: Vec::new(),
@@ -375,11 +381,12 @@ impl RelayServiceInner {
     }
 
     async fn update_status(&mut self) {
-        self.status = if let Some(get_status) = &self.get_status {
+        let status = if let Some(get_status) = &self.get_status {
             get_status().await
         } else {
             Status::default()
-        }
+        };
+        self.status.send_replace(status);
     }
 
     fn add_streamer(&mut self, name: String, address: Ipv4Addr, port: u16) {
@@ -395,8 +402,41 @@ impl RelayServiceInner {
             return;
         };
 
+        // OpenWrt's system.info.localtime includes the timezone offset. Uptime
+        // lets consumers check freshness independently of timezone/NTP changes.
+        let updated_uptime = tokio::fs::read_to_string("/proc/uptime")
+            .await
+            .ok()
+            .and_then(|value| {
+                value
+                    .split_whitespace()
+                    .next()?
+                    .split('.')
+                    .next()?
+                    .parse()
+                    .ok()
+            });
+        let relays: Vec<_> = self
+            .relays
+            .iter()
+            .map(|relay| RuntimeRelayStatus {
+                connection: relay.relay.connection_status(),
+                interface_name: relay.interface_name.clone(),
+                interface_address: relay.interface_address.to_string(),
+                streamer_name: relay.streamer_name.clone(),
+                streamer_url: relay.streamer_url.clone(),
+                streamer_host: host_from_url(&relay.streamer_url),
+            })
+            .collect();
         let status = RuntimeStatus {
-            connected: !self.relays.is_empty(),
+            schema_version: 2,
+            process_id: std::process::id(),
+            updated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            updated_uptime,
+            connected: relays.iter().any(|relay| relay.connection.connected),
             manual_streamer: !self.manual_streamers.is_empty(),
             streamers: self
                 .streamers
@@ -407,17 +447,7 @@ impl RelayServiceInner {
                     host: host_from_url(&streamer.url),
                 })
                 .collect(),
-            relays: self
-                .relays
-                .iter()
-                .map(|relay| RuntimeRelayStatus {
-                    interface_name: relay.interface_name.clone(),
-                    interface_address: relay.interface_address.to_string(),
-                    streamer_name: relay.streamer_name.clone(),
-                    streamer_url: relay.streamer_url.clone(),
-                    streamer_host: host_from_url(&relay.streamer_url),
-                })
-                .collect(),
+            relays,
         };
 
         let Ok(content) = serde_json::to_string(&status) else {
@@ -495,16 +525,10 @@ impl RelayServiceInner {
     }
 
     pub fn create_get_status_closure(&self) -> Option<GetStatusClosure> {
-        let relay_service = self.me.clone();
+        let status = self.status.subscribe();
         Some(Box::new(move || {
-            let relay_service = relay_service.clone();
-            Box::pin(async move {
-                if let Some(relay_service) = relay_service.upgrade() {
-                    relay_service.lock().await.status.clone()
-                } else {
-                    Status::default()
-                }
-            })
+            let status = status.borrow().clone();
+            Box::pin(async move { status })
         }))
     }
 
@@ -568,6 +592,114 @@ pub struct RelayServiceConfig {
 
 pub struct RelayService {
     inner: Arc<Mutex<RelayServiceInner>>,
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_relay_object_does_not_mean_authenticated() {
+        let path = std::env::temp_dir().join(format!("moblink-test-{}.json", Uuid::new_v4()));
+        let service = RelayService::new(
+            RelayServiceConfig {
+                password: "test".into(),
+                network_interfaces_to_allow: vec![],
+                network_interfaces_to_ignore: vec![],
+                streamer_urls: vec![],
+                interface_name_overrides: vec![],
+                runtime_status_file: Some(path.clone()),
+                database: path.with_extension("database"),
+            },
+            None,
+        )
+        .await;
+        let mut inner = service.inner.lock().await;
+        let get_status = inner.create_get_status_closure().unwrap();
+        inner.status.send_replace(Status {
+            battery_percentage: Some(73),
+        });
+        // Connection setup may own this mutex for longer than the handler limit.
+        // Status must still return promptly, with the latest cached value.
+        let status = tokio::time::timeout(Duration::from_millis(100), get_status())
+            .await
+            .unwrap();
+        assert_eq!(status.battery_percentage, Some(73));
+
+        inner.relays.push(ServiceRelay {
+            interface_name: "eth0".into(),
+            interface_address: Ipv4Addr::LOCALHOST,
+            streamer_name: "test".into(),
+            streamer_url: "ws://localhost:7777".into(),
+            relay: Relay::new(),
+        });
+        inner.write_runtime_status().await;
+        let value: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["process_id"], std::process::id());
+        assert!(value["updated_at"].as_u64().unwrap() > 0);
+        // Uptime is optional on systems without /proc/uptime, including macOS.
+        let uptime = value.get("updated_uptime").unwrap();
+        assert!(uptime.is_null() || uptime.as_u64().is_some());
+        assert_eq!(value["connected"], false);
+        assert_eq!(value["relays"][0]["connected"], false);
+        // Update authentication concurrently with repeated file snapshots.
+        use crate::protocol::{Identified, MessageToRelay, MoblinkResult, Present};
+        use futures_util::SinkExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = &inner.relays[0].relay;
+        relay
+            .setup(
+                format!("ws://{}", listener.local_addr().unwrap()),
+                "test".into(),
+                Uuid::new_v4(),
+                "test".into(),
+                |_| {},
+                None,
+            )
+            .await;
+        let (_, mut server) = tokio::join!(relay.start(), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let updates = tokio::spawn(async move {
+            for index in 0..200 {
+                let result = if index % 2 == 0 {
+                    MoblinkResult::Ok(Present {})
+                } else {
+                    MoblinkResult::WrongPassword(Present {})
+                };
+                let message = MessageToRelay::Identified(Identified { result });
+                server
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::to_string(&message).unwrap().into(),
+                    ))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            server
+        });
+        let mut saw_connected = false;
+        for _ in 0..200 {
+            inner.write_runtime_status().await;
+            let value: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            let any_connected = value["relays"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relay| relay["connected"] == true);
+            assert_eq!(value["connected"], any_connected);
+            saw_connected |= any_connected;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let _server = updates.await.unwrap();
+        assert!(saw_connected);
+        inner.relays[0].relay.stop().await;
+        tokio::fs::remove_file(path).await.unwrap();
+    }
 }
 
 impl RelayService {
