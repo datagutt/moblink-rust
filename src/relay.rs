@@ -7,13 +7,13 @@ use std::sync::{Arc, Weak};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::process::Command;
-use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::sync::{Mutex, watch};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use uuid::Uuid;
@@ -30,6 +30,13 @@ pub struct Status {
 pub type GetStatusClosure =
     Box<dyn Fn() -> Pin<Box<dyn Future<Output = Status> + Send + Sync>> + Send + Sync>;
 
+#[derive(Clone, Default, Serialize)]
+pub struct ConnectionStatus {
+    pub connected: bool,
+    pub wrong_password: bool,
+    pub streamer_ip: Option<String>,
+}
+
 struct RelayInner {
     me: Weak<Mutex<Self>>,
     /// Store a local IP address  for binding UDP sockets
@@ -44,6 +51,9 @@ struct RelayInner {
     started: bool,
     connected: bool,
     wrong_password: bool,
+    connection_status: watch::Sender<ConnectionStatus>,
+    streamer_ip: Option<String>,
+    websocket_generation: u64,
     reconnect_on_tunnel_error: Arc<Mutex<bool>>,
     start_on_reconnect_soon: Arc<Mutex<bool>>,
     relay_to_destination: Option<tokio::task::JoinHandle<Result<(), AnyError>>>,
@@ -51,7 +61,7 @@ struct RelayInner {
 }
 
 impl RelayInner {
-    fn new() -> Arc<Mutex<Self>> {
+    fn new(connection_status: watch::Sender<ConnectionStatus>) -> Arc<Mutex<Self>> {
         Arc::new_cyclic(|me| {
             Mutex::new(Self {
                 me: me.clone(),
@@ -66,6 +76,9 @@ impl RelayInner {
                 started: false,
                 connected: false,
                 wrong_password: false,
+                connection_status,
+                streamer_ip: None,
+                websocket_generation: 0,
                 reconnect_on_tunnel_error: Arc::new(Mutex::new(false)),
                 start_on_reconnect_soon: Arc::new(Mutex::new(false)),
                 relay_to_destination: None,
@@ -157,6 +170,13 @@ impl RelayInner {
         match timeout(Duration::from_secs(10), connect_async(request.to_string())).await {
             Ok(Ok((ws_stream, _))) => {
                 debug!("Connected to {}", self.streamer_url);
+                self.streamer_ip = match ws_stream.get_ref() {
+                    MaybeTlsStream::Plain(stream) => {
+                        stream.peer_addr().ok().map(|p| p.ip().to_string())
+                    }
+                    _ => None,
+                };
+                self.update_status();
                 let (writer, reader) = ws_stream.split();
                 self.ws_writer = Some(writer);
                 self.start_websocket_receiver(reader);
@@ -184,73 +204,108 @@ impl RelayInner {
     ) {
         // Task to process messages received from the channel.
         let relay = self.me.clone();
+        let generation = self.websocket_generation;
 
         tokio::spawn(async move {
             let Some(relay_arc) = relay.upgrade() else {
                 return;
             };
 
-            while let Some(result) = reader.next().await {
-                let mut relay = relay_arc.lock().await;
-                match result {
-                    Ok(message) => match message {
-                        Message::Text(text) => {
-                            match serde_json::from_str::<MessageToRelay>(&text) {
-                                Ok(message) => {
-                                    if let Err(error) = relay.handle_message(message).await {
-                                        error!("Message handling failed with error: {}", error);
-                                        relay.reconnect_soon().await;
-                                        break;
-                                    }
-                                }
-                                _ => {
-                                    error!("Failed to deserialize message: {}", text);
-                                }
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+            let mut last_received = Instant::now();
+            loop {
+                let deadline = last_received + Duration::from_secs(45);
+                let result = tokio::select! {
+                    message = tokio::time::timeout_at(deadline, reader.next()) => {
+                        let Ok(Some(result)) = message else { break };
+                        last_received = Instant::now();
+                        result
+                    }
+                    _ = heartbeat.tick() => {
+                        let sent = timeout(Duration::from_secs(5), async {
+                            let mut relay = relay_arc.lock().await;
+                            if generation != relay.websocket_generation || !relay.started {
+                                return false;
                             }
-                        }
-                        Message::Binary(data) => {
-                            debug!("Received binary message of length: {}", data.len());
-                        }
-                        Message::Ping(data) => {
-                            relay.send_message(Message::Pong(data)).await.ok();
-                        }
-                        Message::Pong(_) => {
-                            debug!("Received pong message");
-                        }
-                        Message::Close(frame) => {
-                            info!("Received close message: {:?}", frame);
-                            relay.reconnect_soon().await;
+                            relay.send_message(Message::Ping(Vec::new().into())).await.is_ok()
+                        }).await;
+                        if !matches!(sent, Ok(true)) {
                             break;
                         }
-                        Message::Frame(_) => {
-                            unreachable!("This is never used")
-                        }
-                    },
-                    Err(e) => {
-                        debug!("Error processing message: {}", e);
-                        // TODO: There has to be a better way to handle this
-                        if e.to_string()
-                            .contains("Connection reset without closing handshake")
-                        {
-                            relay.reconnect_soon().await;
-                        }
-                        break;
+                        continue;
                     }
+                };
+                // A received frame gets a fresh processing budget, independent
+                // of the previous inactivity deadline, including mutex waits.
+                let keep_reading = timeout(Duration::from_secs(5), async {
+                    let mut relay = relay_arc.lock().await;
+                    if generation != relay.websocket_generation || !relay.started {
+                        return false;
+                    }
+                    match result {
+                        Ok(message) => match message {
+                            Message::Text(text) => {
+                                match serde_json::from_str::<MessageToRelay>(&text) {
+                                    Ok(message) => {
+                                        let result = relay.handle_message(message).await;
+                                        if let Err(error) = result {
+                                            error!("Message handling failed with error: {}", error);
+                                            return false;
+                                        }
+                                    }
+                                    _ => {
+                                        error!("Failed to deserialize message: {}", text);
+                                    }
+                                }
+                            }
+                            Message::Binary(data) => {
+                                debug!("Received binary message of length: {}", data.len());
+                            }
+                            Message::Ping(data) => {
+                                if relay.send_message(Message::Pong(data)).await.is_err() {
+                                    return false;
+                                }
+                            }
+                            Message::Pong(_) => {
+                                debug!("Received pong message");
+                            }
+                            Message::Close(frame) => {
+                                info!("Received close message: {:?}", frame);
+                                return false;
+                            }
+                            Message::Frame(_) => {
+                                unreachable!("This is never used")
+                            }
+                        },
+                        Err(e) => {
+                            debug!("Error processing message: {}", e);
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .await;
+                if !matches!(keep_reading, Ok(true)) {
+                    break;
                 }
+            }
+            let mut relay = relay_arc.lock().await;
+            if generation == relay.websocket_generation && relay.started {
+                relay.reconnect_soon().await;
             }
         });
     }
 
     async fn stop_internal(&mut self) {
+        self.websocket_generation = self.websocket_generation.wrapping_add(1);
+        self.connected = false;
+        self.wrong_password = false;
+        self.streamer_ip = None;
+        self.update_status();
         if let Some(mut ws_writer) = self.ws_writer.take() {
-            match ws_writer.close().await {
-                Err(e) => {
-                    error!("Error closing WebSocket: {}", e);
-                }
-                _ => {
-                    debug!("WebSocket closed successfully");
-                }
-            }
+            timeout(Duration::from_secs(2), ws_writer.close())
+                .await
+                .ok();
         }
         self.connected = false;
         self.wrong_password = false;
@@ -276,6 +331,11 @@ impl RelayInner {
     }
 
     fn update_status(&self) {
+        self.connection_status.send_replace(ConnectionStatus {
+            connected: self.connected,
+            wrong_password: self.wrong_password,
+            streamer_ip: self.streamer_ip.clone(),
+        });
         let Some(on_status_updated) = &self.on_status_updated else {
             return;
         };
@@ -305,10 +365,12 @@ impl RelayInner {
         tokio::spawn(async move {
             sleep(Duration::from_secs(5)).await;
 
-            if *start_on_reconnect_soon.lock().await {
-                debug!("Reconnecting...");
-                if let Some(relay) = relay.upgrade() {
-                    relay.lock().await.start_internal().await;
+            if let Some(relay) = relay.upgrade() {
+                let mut relay = relay.lock().await;
+                let should_start = *start_on_reconnect_soon.lock().await;
+                if should_start {
+                    debug!("Reconnecting...");
+                    relay.start_internal().await;
                 }
             }
         });
@@ -342,8 +404,10 @@ impl RelayInner {
         match identified.result {
             MoblinkResult::Ok(_) => {
                 self.connected = true;
+                self.wrong_password = false;
             }
             MoblinkResult::WrongPassword(_) => {
+                self.connected = false;
                 self.wrong_password = true;
             }
         }
@@ -485,13 +549,14 @@ impl RelayInner {
         let Some(writer) = self.ws_writer.as_mut() else {
             return Err("No websocket writer".into());
         };
-        writer.send(message).await?;
+        timeout(Duration::from_secs(5), writer.send(message)).await??;
         Ok(())
     }
 }
 
 pub struct Relay {
     inner: Arc<Mutex<RelayInner>>,
+    connection_status: watch::Receiver<ConnectionStatus>,
 }
 
 impl Default for Relay {
@@ -502,9 +567,17 @@ impl Default for Relay {
 
 impl Relay {
     pub fn new() -> Self {
+        let (sender, receiver) = watch::channel(ConnectionStatus::default());
         Self {
-            inner: RelayInner::new(),
+            inner: RelayInner::new(sender),
+            connection_status: receiver,
         }
+    }
+
+    // A snapshot must not lock RelayInner while the supervisor holds its own lock:
+    // relay status callbacks can acquire the supervisor lock in the opposite order.
+    pub fn connection_status(&self) -> ConnectionStatus {
+        self.connection_status.borrow().clone()
     }
 
     pub async fn set_bind_address(&self, address: String) {
@@ -546,6 +619,259 @@ impl Relay {
 
     pub async fn stop(&self) {
         self.inner.lock().await.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    async fn pair() -> (Relay, WebSocketStream<TcpStream>, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Relay::new();
+        relay
+            .setup(
+                format!("ws://localhost:{}", listener.local_addr().unwrap().port()),
+                "test".into(),
+                Uuid::new_v4(),
+                "test".into(),
+                |_| {},
+                None,
+            )
+            .await;
+        let (_, server) = tokio::join!(relay.start(), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        });
+        (relay, server, listener)
+    }
+
+    async fn wait_state(relay: &Relay, connected: bool, wrong_password: bool) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let status = relay.connection_status();
+                if status.connected == connected && status.wrong_password == wrong_password {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn identify(server: &mut WebSocketStream<TcpStream>, result: MoblinkResult) {
+        let message =
+            serde_json::to_string(&MessageToRelay::Identified(Identified { result })).unwrap();
+        server.send(Message::Text(message.into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_and_wrong_password_are_distinct_from_tcp() {
+        let (relay, mut server, _listener) = pair().await;
+        assert!(!relay.connection_status().connected);
+        assert_eq!(
+            relay.connection_status().streamer_ip.as_deref(),
+            Some("127.0.0.1")
+        );
+        identify(&mut server, MoblinkResult::WrongPassword(Present {})).await;
+        wait_state(&relay, false, true).await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        relay.stop().await;
+        wait_state(&relay, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn socket_loss_clears_authentication_and_reconnects() {
+        let (relay, mut server, listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        drop(server);
+        wait_state(&relay, false, false).await;
+        let _new_server = timeout(Duration::from_secs(8), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(!relay.connection_status().connected);
+        relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn graceful_close_clears_authentication() {
+        let (relay, mut server, _listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        server.close(None).await.unwrap();
+        wait_state(&relay, false, false).await;
+        relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn failed_connections_keep_retrying_without_a_timer_lock_deadlock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let relay = Relay::new();
+        relay
+            .setup(
+                format!("ws://{address}"),
+                "test".into(),
+                Uuid::new_v4(),
+                "test".into(),
+                |_| {},
+                None,
+            )
+            .await;
+        relay.start().await;
+        sleep(Duration::from_secs(11)).await;
+        let inner = timeout(Duration::from_secs(1), relay.inner.lock())
+            .await
+            .unwrap();
+        assert!(inner.websocket_generation >= 3);
+        drop(inner);
+        relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_retry_waiting_for_mutex_cannot_replace_session() {
+        let (relay, mut server, listener) = pair().await;
+        let mut inner = relay.inner.lock().await;
+        inner.reconnect_soon().await;
+        // The timer expires while stop/restart owns the mutex.
+        sleep(Duration::from_secs(6)).await;
+        inner.stop_internal().await;
+        let (_, replacement) = tokio::join!(inner.start_internal(), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        });
+        server.close(None).await.ok();
+        drop(inner);
+        let mut replacement = replacement;
+        identify(&mut replacement, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        assert!(
+            timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(relay.connection_status().connected);
+        relay.stop().await;
+    }
+
+    async fn stalled_status_pair() -> (Relay, WebSocketStream<TcpStream>, TcpListener) {
+        let (relay, mut server, listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        relay.inner.lock().await.get_status = Some(Arc::new(Box::new(move || {
+            let notify = notify.clone();
+            Box::pin(async move {
+                notify.notify_one();
+                std::future::pending().await
+            })
+        })));
+        let request = MessageToRelay::Request(MessageRequest {
+            id: 1,
+            data: MessageRequestData::Status(Present {}),
+        });
+        server
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        (relay, server, listener)
+    }
+
+    #[tokio::test]
+    async fn stalled_status_handler_disconnects_and_retries() {
+        let (relay, _server, listener) = stalled_status_pair().await;
+        timeout(Duration::from_secs(8), async {
+            while relay.connection_status().connected {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _replacement = timeout(Duration::from_secs(8), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        })
+        .await
+        .unwrap();
+        relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stop_is_bounded_while_status_handler_stalls() {
+        let (relay, _server, _listener) = stalled_status_pair().await;
+        timeout(Duration::from_secs(8), relay.stop()).await.unwrap();
+        assert!(!relay.connection_status().connected);
+        assert!(!relay.is_started().await);
+    }
+
+    #[tokio::test]
+    async fn status_near_idle_deadline_gets_fresh_processing_budget() {
+        let (relay, mut server, _listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        relay.inner.lock().await.get_status = Some(Arc::new(Box::new(|| {
+            Box::pin(async {
+                sleep(Duration::from_secs(2)).await;
+                Status {
+                    battery_percentage: Some(73),
+                }
+            })
+        })));
+        // Leave pings unread so they cannot refresh the receive deadline.
+        sleep(Duration::from_secs(44)).await;
+        let request = MessageToRelay::Request(MessageRequest {
+            id: 42,
+            data: MessageRequestData::Status(Present {}),
+        });
+        server
+            .send(Message::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let response = timeout(Duration::from_secs(4), async {
+            loop {
+                if let Message::Text(text) = server.next().await.unwrap().unwrap() {
+                    break text;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["response"]["id"], 42);
+        assert_eq!(
+            response["response"]["data"]["status"]["batteryPercentage"],
+            73
+        );
+        assert!(relay.connection_status().connected);
+        relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn silent_peer_is_disconnected_by_heartbeat() {
+        let (relay, mut server, _listener) = pair().await;
+        identify(&mut server, MoblinkResult::Ok(Present {})).await;
+        wait_state(&relay, true, false).await;
+        // Keep the TCP connection open but never read/respond to WebSocket pings.
+        sleep(Duration::from_secs(47)).await;
+        wait_state(&relay, false, false).await;
+        relay.stop().await;
     }
 }
 
@@ -665,7 +991,11 @@ pub fn create_get_status_closure(
         let status_file = status_file.clone();
         Box::pin(async move {
             let output = if let Some(status_executable) = &status_executable {
-                let Ok(output) = Command::new(status_executable).output().await else {
+                let Ok(output) = Command::new(status_executable)
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                else {
                     return Default::default();
                 };
                 output.stdout
