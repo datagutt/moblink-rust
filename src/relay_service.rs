@@ -237,7 +237,7 @@ struct RelayServiceInner {
     status: watch::Sender<Status>,
     relays: Vec<ServiceRelay>,
     network_interfaces: Vec<NetworkInterface>,
-    streamers: Vec<Streamer>,
+    discovered_streamers: HashMap<String, Streamer>,
     network_interface_monitor: Option<JoinHandle<()>>,
     streamers_monitor: Option<JoinHandle<()>>,
     get_status_updater: Option<JoinHandle<()>>,
@@ -267,7 +267,7 @@ impl RelayServiceInner {
                 status: watch::channel(Status::default()).0,
                 relays: Vec::new(),
                 network_interfaces: Vec::new(),
-                streamers: Vec::new(),
+                discovered_streamers: HashMap::new(),
                 network_interface_monitor: None,
                 streamers_monitor: None,
                 get_status_updater: None,
@@ -281,11 +281,10 @@ impl RelayServiceInner {
         if self.manual_streamers.is_empty() {
             self.start_streamers_monitor();
         } else {
-            self.streamers = self.manual_streamers.clone();
             self.updated().await;
             info!(
                 "Using {} manually configured streamer URL(s)",
-                self.streamers.len()
+                self.manual_streamers.len()
             );
         }
         self.start_get_status_updater();
@@ -336,32 +335,37 @@ impl RelayServiceInner {
                     return;
                 };
                 while let Ok(event) = receiver.recv_async().await {
-                    if let ServiceEvent::ServiceResolved(info) = event {
-                        info!(
-                            "mDNS-SD: Found streamer {} {:?} {}",
-                            info.get_fullname(),
-                            info.get_addresses(),
-                            info.get_port()
-                        );
-                        let Some(name) = info.get_property_val_str("name") else {
-                            continue;
-                        };
-                        let addresses = info.get_addresses_v4();
-                        if any_address_belongs_to_this_machine(&addresses) {
-                            continue;
+                    let (fullname, streamer) = match event {
+                        ServiceEvent::ServiceResolved(info) => {
+                            info!(
+                                "mDNS-SD: Found streamer {} {:?} {}",
+                                info.get_fullname(),
+                                info.get_addresses(),
+                                info.get_port()
+                            );
+                            let addresses = info.get_addresses_v4();
+                            let streamer = if any_address_belongs_to_this_machine(&addresses) {
+                                None
+                            } else {
+                                info.get_property_val_str("name")
+                                    .zip(addresses.iter().min())
+                                    .map(|(name, address)| Streamer {
+                                        name: name.to_owned(),
+                                        url: format!("ws://{}:{}", address, info.get_port()),
+                                    })
+                            };
+                            (info.get_fullname().to_owned(), streamer)
                         }
-                        let Some(address) = addresses.iter().next().cloned() else {
-                            continue;
-                        };
-                        let Some(relay_service) = relay_service.upgrade() else {
-                            break;
-                        };
-                        {
-                            let mut relay_service = relay_service.lock().await;
-                            relay_service.add_streamer(name.to_string(), address, info.get_port());
-                            relay_service.updated().await;
-                        }
-                    }
+                        ServiceEvent::ServiceRemoved(_, fullname) => (fullname, None),
+                        _ => continue,
+                    };
+                    let Some(relay_service) = relay_service.upgrade() else {
+                        return;
+                    };
+                    let mut relay_service = relay_service.lock().await;
+                    relay_service
+                        .update_discovered_streamer(fullname, streamer)
+                        .await;
                 }
             }
         }));
@@ -389,10 +393,14 @@ impl RelayServiceInner {
         self.status.send_replace(status);
     }
 
-    fn add_streamer(&mut self, name: String, address: Ipv4Addr, port: u16) {
-        let url = format!("ws://{}:{}", address, port);
-        self.streamers.retain(|streamer| streamer.url != url);
-        self.streamers.push(Streamer { name, url });
+    async fn update_discovered_streamer(&mut self, fullname: String, streamer: Option<Streamer>) {
+        let fullname = fullname.to_ascii_lowercase();
+        if let Some(streamer) = streamer {
+            self.discovered_streamers.insert(fullname, streamer);
+        } else if self.discovered_streamers.remove(&fullname).is_none() {
+            return;
+        }
+        self.updated().await;
     }
 
     // Writes the current relay/streamer state to a JSON file so external UIs
@@ -439,8 +447,9 @@ impl RelayServiceInner {
             connected: relays.iter().any(|relay| relay.connection.connected),
             manual_streamer: !self.manual_streamers.is_empty(),
             streamers: self
-                .streamers
+                .manual_streamers
                 .iter()
+                .chain(self.discovered_streamers.values())
                 .map(|streamer| RuntimeStreamerStatus {
                     name: streamer.name.clone(),
                     url: streamer.url.clone(),
@@ -477,8 +486,8 @@ impl RelayServiceInner {
 
     async fn updated(&mut self) {
         let old_number_of_relays = self.relays.len();
-        self.add_relays().await;
         self.remove_relays().await;
+        self.add_relays().await;
         let new_number_of_relays = self.relays.len();
         if new_number_of_relays != old_number_of_relays {
             info!("Number of relays: {}", new_number_of_relays);
@@ -494,7 +503,11 @@ impl RelayServiceInner {
             if interface_address.is_loopback() {
                 continue;
             }
-            for streamer in &self.streamers {
+            for streamer in self
+                .manual_streamers
+                .iter()
+                .chain(self.discovered_streamers.values())
+            {
                 if self.relay_already_added(interface_address, &streamer.url) {
                     continue;
                 }
@@ -542,7 +555,14 @@ impl RelayServiceInner {
         let mut relays_to_keep: Vec<ServiceRelay> = Vec::new();
         let mut relays_to_remove: Vec<ServiceRelay> = Vec::new();
         for relay in self.relays.drain(..) {
-            if Self::should_keep_relay(&self.network_interfaces, relay.interface_address) {
+            let streamer_exists = self
+                .manual_streamers
+                .iter()
+                .chain(self.discovered_streamers.values())
+                .any(|streamer| streamer.url == relay.streamer_url);
+            if streamer_exists
+                && Self::should_keep_relay(&self.network_interfaces, relay.interface_address)
+            {
                 relays_to_keep.push(relay);
             } else {
                 relays_to_remove.push(relay);
@@ -597,6 +617,71 @@ pub struct RelayService {
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replacing_or_removing_discovered_url_retires_only_its_relay() {
+        let service = RelayServiceInner::new(
+            RelayServiceConfig {
+                password: String::new(),
+                network_interfaces_to_allow: vec![],
+                network_interfaces_to_ignore: vec![],
+                streamer_urls: vec![],
+                interface_name_overrides: vec![],
+                runtime_status_file: None,
+                database: PathBuf::new(),
+            },
+            None,
+        )
+        .await;
+        let mut service = service.lock().await;
+        // Keep the interface present while reconciling without opening sockets.
+        let address = Ipv4Addr::LOCALHOST;
+        service.network_interfaces = vec![NetworkInterface::new_afinet(
+            "lo", address, None, None, 1, true,
+        )];
+        let fullname = format!("Streamer.{MDNS_SERVICE_TYPE}");
+        let other = format!("Other.{MDNS_SERVICE_TYPE}");
+        let old_url = "ws://192.0.2.1:7777";
+        let new_url = "ws://192.0.2.2:7777";
+        let streamer = |url: &str| Streamer {
+            name: "Shared display name".into(),
+            url: url.into(),
+        };
+        let relay = |url: &str| ServiceRelay {
+            interface_name: "lo".into(),
+            interface_address: address,
+            streamer_name: streamer(url).name,
+            streamer_url: url.into(),
+            relay: Relay::new(),
+        };
+        service
+            .update_discovered_streamer(fullname.clone(), Some(streamer(old_url)))
+            .await;
+        service
+            .update_discovered_streamer(other.clone(), Some(streamer(new_url)))
+            .await;
+        service.relays.push(relay(old_url));
+        service.relays.push(relay(new_url));
+
+        service
+            .update_discovered_streamer(fullname.clone(), Some(streamer(new_url)))
+            .await;
+        assert_eq!(service.discovered_streamers.len(), 2);
+        assert_eq!(service.relays.len(), 1, "the replaced URL was retired");
+        assert_eq!(service.relays[0].streamer_url, new_url);
+
+        service.update_discovered_streamer(other, None).await;
+        assert_eq!(
+            service.relays.len(),
+            1,
+            "the remaining instance still advertises this URL"
+        );
+        service
+            .update_discovered_streamer(fullname.to_ascii_uppercase(), None)
+            .await;
+        assert!(service.discovered_streamers.is_empty());
+        assert!(service.relays.is_empty());
+    }
 
     #[tokio::test]
     async fn a_relay_object_does_not_mean_authenticated() {
