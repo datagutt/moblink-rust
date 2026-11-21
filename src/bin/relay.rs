@@ -43,8 +43,10 @@ struct Args {
     #[arg(long)]
     no_log_timestamps: bool,
 
-    /// Status executable.
-    /// Print status to standard output on format {"batteryPercentage": 93}.
+    /// Print status JSON to stdout, for example {"batteryPercentage": 93}.
+    ///
+    /// After 3 seconds, the relay returns empty status and kills only the direct
+    /// child process. Any subprocesses it launched can continue running.
     #[arg(long)]
     status_executable: Option<String>,
 
