@@ -970,11 +970,10 @@ pub fn create_get_status_closure(
         let status_file = status_file.clone();
         Box::pin(async move {
             let output = if let Some(status_executable) = &status_executable {
-                let Ok(output) = Command::new(status_executable)
-                    .kill_on_drop(true)
-                    .output()
-                    .await
-                else {
+                let mut command = Command::new(status_executable);
+                command.kill_on_drop(true);
+                // Leave time for the status reply within the frame budget.
+                let Ok(Ok(output)) = timeout(Duration::from_secs(3), command.output()).await else {
                     return Default::default();
                 };
                 output.stdout
