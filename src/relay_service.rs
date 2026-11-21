@@ -237,7 +237,7 @@ struct RelayServiceInner {
     status: watch::Sender<Status>,
     relays: Vec<ServiceRelay>,
     network_interfaces: Vec<NetworkInterface>,
-    streamers: Vec<Streamer>,
+    discovered_streamers: HashMap<String, Streamer>,
     network_interface_monitor: Option<JoinHandle<()>>,
     streamers_monitor: Option<JoinHandle<()>>,
     get_status_updater: Option<JoinHandle<()>>,
@@ -267,7 +267,7 @@ impl RelayServiceInner {
                 status: watch::channel(Status::default()).0,
                 relays: Vec::new(),
                 network_interfaces: Vec::new(),
-                streamers: Vec::new(),
+                discovered_streamers: HashMap::new(),
                 network_interface_monitor: None,
                 streamers_monitor: None,
                 get_status_updater: None,
@@ -281,11 +281,10 @@ impl RelayServiceInner {
         if self.manual_streamers.is_empty() {
             self.start_streamers_monitor();
         } else {
-            self.streamers = self.manual_streamers.clone();
             self.updated().await;
             info!(
                 "Using {} manually configured streamer URL(s)",
-                self.streamers.len()
+                self.manual_streamers.len()
             );
         }
         self.start_get_status_updater();
@@ -336,32 +335,37 @@ impl RelayServiceInner {
                     return;
                 };
                 while let Ok(event) = receiver.recv_async().await {
-                    if let ServiceEvent::ServiceResolved(info) = event {
-                        info!(
-                            "mDNS-SD: Found streamer {} {:?} {}",
-                            info.get_fullname(),
-                            info.get_addresses(),
-                            info.get_port()
-                        );
-                        let Some(name) = info.get_property_val_str("name") else {
-                            continue;
-                        };
-                        let addresses = info.get_addresses_v4();
-                        if any_address_belongs_to_this_machine(&addresses) {
-                            continue;
+                    let (fullname, streamer) = match event {
+                        ServiceEvent::ServiceResolved(info) => {
+                            info!(
+                                "mDNS-SD: Found streamer {} {:?} {}",
+                                info.get_fullname(),
+                                info.get_addresses(),
+                                info.get_port()
+                            );
+                            let addresses = info.get_addresses_v4();
+                            let streamer = if any_address_belongs_to_this_machine(&addresses) {
+                                None
+                            } else {
+                                info.get_property_val_str("name")
+                                    .zip(addresses.iter().min())
+                                    .map(|(name, address)| Streamer {
+                                        name: name.to_owned(),
+                                        url: format!("ws://{}:{}", address, info.get_port()),
+                                    })
+                            };
+                            (info.get_fullname().to_owned(), streamer)
                         }
-                        let Some(address) = addresses.iter().next().cloned() else {
-                            continue;
-                        };
-                        let Some(relay_service) = relay_service.upgrade() else {
-                            break;
-                        };
-                        {
-                            let mut relay_service = relay_service.lock().await;
-                            relay_service.add_streamer(name.to_string(), address, info.get_port());
-                            relay_service.updated().await;
-                        }
-                    }
+                        ServiceEvent::ServiceRemoved(_, fullname) => (fullname, None),
+                        _ => continue,
+                    };
+                    let Some(relay_service) = relay_service.upgrade() else {
+                        return;
+                    };
+                    let mut relay_service = relay_service.lock().await;
+                    relay_service
+                        .update_discovered_streamer(fullname, streamer)
+                        .await;
                 }
             }
         }));
@@ -389,10 +393,14 @@ impl RelayServiceInner {
         self.status.send_replace(status);
     }
 
-    fn add_streamer(&mut self, name: String, address: Ipv4Addr, port: u16) {
-        let url = format!("ws://{}:{}", address, port);
-        self.streamers.retain(|streamer| streamer.url != url);
-        self.streamers.push(Streamer { name, url });
+    async fn update_discovered_streamer(&mut self, fullname: String, streamer: Option<Streamer>) {
+        let fullname = fullname.to_ascii_lowercase();
+        if let Some(streamer) = streamer {
+            self.discovered_streamers.insert(fullname, streamer);
+        } else if self.discovered_streamers.remove(&fullname).is_none() {
+            return;
+        }
+        self.updated().await;
     }
 
     // Writes the current relay/streamer state to a JSON file so external UIs
@@ -439,8 +447,9 @@ impl RelayServiceInner {
             connected: relays.iter().any(|relay| relay.connection.connected),
             manual_streamer: !self.manual_streamers.is_empty(),
             streamers: self
-                .streamers
+                .manual_streamers
                 .iter()
+                .chain(self.discovered_streamers.values())
                 .map(|streamer| RuntimeStreamerStatus {
                     name: streamer.name.clone(),
                     url: streamer.url.clone(),
@@ -477,8 +486,8 @@ impl RelayServiceInner {
 
     async fn updated(&mut self) {
         let old_number_of_relays = self.relays.len();
-        self.add_relays().await;
         self.remove_relays().await;
+        self.add_relays().await;
         let new_number_of_relays = self.relays.len();
         if new_number_of_relays != old_number_of_relays {
             info!("Number of relays: {}", new_number_of_relays);
@@ -494,7 +503,11 @@ impl RelayServiceInner {
             if interface_address.is_loopback() {
                 continue;
             }
-            for streamer in &self.streamers {
+            for streamer in self
+                .manual_streamers
+                .iter()
+                .chain(self.discovered_streamers.values())
+            {
                 if self.relay_already_added(interface_address, &streamer.url) {
                     continue;
                 }
@@ -527,6 +540,7 @@ impl RelayServiceInner {
     pub fn create_get_status_closure(&self) -> Option<GetStatusClosure> {
         let status = self.status.subscribe();
         Some(Box::new(move || {
+            // Retirement can hold the service lock while waiting for the relay.
             let status = status.borrow().clone();
             Box::pin(async move { status })
         }))
@@ -542,7 +556,14 @@ impl RelayServiceInner {
         let mut relays_to_keep: Vec<ServiceRelay> = Vec::new();
         let mut relays_to_remove: Vec<ServiceRelay> = Vec::new();
         for relay in self.relays.drain(..) {
-            if Self::should_keep_relay(&self.network_interfaces, relay.interface_address) {
+            let streamer_exists = self
+                .manual_streamers
+                .iter()
+                .chain(self.discovered_streamers.values())
+                .any(|streamer| streamer.url == relay.streamer_url);
+            if streamer_exists
+                && Self::should_keep_relay(&self.network_interfaces, relay.interface_address)
+            {
                 relays_to_keep.push(relay);
             } else {
                 relays_to_remove.push(relay);
@@ -596,7 +617,275 @@ pub struct RelayService {
 
 #[cfg(test)]
 mod runtime_tests {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::{WebSocketStream, accept_async};
+
     use super::*;
+    use crate::protocol::{
+        MessageRequest, MessageRequestData, MessageToRelay, MessageToStreamer, Present,
+        ResponseData, StartTunnelRequest,
+    };
+
+    async fn send_request(
+        peer: &mut WebSocketStream<TcpStream>,
+        id: u32,
+        data: MessageRequestData,
+    ) {
+        let request = MessageToRelay::Request(MessageRequest { id, data });
+        peer.send(Message::Text(
+            serde_json::to_string(&request).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn next_response(peer: &mut WebSocketStream<TcpStream>, id: u32) -> ResponseData {
+        let message = loop {
+            let message = peer.next().await.unwrap().unwrap();
+            match message {
+                Message::Ping(payload) => peer.send(Message::Pong(payload)).await.unwrap(),
+                _ => break message,
+            }
+        };
+        let MessageToStreamer::Response(response) =
+            serde_json::from_str(message.to_text().unwrap()).unwrap()
+        else {
+            panic!("expected response to {id}");
+        };
+        assert_eq!(response.id, id);
+        response.data
+    }
+
+    #[tokio::test]
+    async fn withdrawal_during_status_stops_websocket_and_both_udp_paths() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let destination = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let service = RelayServiceInner::new(
+            RelayServiceConfig {
+                password: String::new(),
+                network_interfaces_to_allow: vec![],
+                network_interfaces_to_ignore: vec![],
+                streamer_urls: vec![],
+                interface_name_overrides: vec![],
+                runtime_status_file: None,
+                database: PathBuf::new(),
+            },
+            None,
+        )
+        .await;
+        let mut service = service.lock().await;
+        service.status.send_replace(Status {
+            battery_percentage: Some(73),
+        });
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let snapshot = Arc::new(service.create_get_status_closure().unwrap());
+        let get_status: GetStatusClosure = {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            Box::new(move || {
+                let entered = entered.clone();
+                let resume = resume.clone();
+                let snapshot = snapshot.clone();
+                Box::pin(async move {
+                    entered.notify_one();
+                    resume.notified().await;
+                    snapshot().await
+                })
+            })
+        };
+        let address = Ipv4Addr::LOCALHOST;
+        service.network_interfaces = vec![NetworkInterface::new_afinet(
+            "lo", address, None, None, 1, true,
+        )];
+        let fullname = format!("Streamer.{MDNS_SERVICE_TYPE}");
+        let name = "Streamer".to_owned();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        service
+            .update_discovered_streamer(
+                fullname.clone(),
+                Some(Streamer {
+                    name: name.clone(),
+                    url: url.clone(),
+                }),
+            )
+            .await;
+
+        let limit = Duration::from_secs(3);
+        let (relay, mut peer) = timeout(limit, async {
+            tokio::join!(
+                ServiceRelay::new(
+                    "lo".into(),
+                    address,
+                    name.clone(),
+                    Streamer { name, url },
+                    String::new(),
+                    Some(get_status),
+                    service.database.clone(),
+                ),
+                async {
+                    accept_async(listener.accept().await.unwrap().0)
+                        .await
+                        .unwrap()
+                },
+            )
+        })
+        .await
+        .expect("establish live WebSocket");
+        service.relays.push(relay);
+
+        let (streamer_port, return_addr) = timeout(limit, async {
+            send_request(
+                &mut peer,
+                1,
+                MessageRequestData::StartTunnel(StartTunnelRequest {
+                    address: address.to_string(),
+                    port: destination.local_addr().unwrap().port(),
+                }),
+            )
+            .await;
+            let ResponseData::StartTunnel(tunnel) = next_response(&mut peer, 1).await else {
+                panic!("expected tunnel response");
+            };
+            let streamer_port = (address, tunnel.port);
+            sender.send_to(b"outbound", streamer_port).await.unwrap();
+            let mut buf = [0; 32];
+            let (len, return_addr) = destination.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], b"outbound");
+            destination.send_to(b"inbound", return_addr).await.unwrap();
+            let (len, _) = sender.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], b"inbound");
+            (streamer_port, return_addr)
+        })
+        .await
+        .expect("prove traffic in both directions before withdrawal");
+
+        timeout(limit, async {
+            send_request(&mut peer, 2, MessageRequestData::Status(Present {})).await;
+            entered.notified().await;
+            // The reader owns the relay lock. Poll withdrawal first, under
+            // the service lock, before allowing the reader to fetch status.
+            tokio::join!(
+                biased;
+                service.update_discovered_streamer(fullname, None),
+                async {
+                    resume.notify_one();
+                    let ResponseData::Status(status) = next_response(&mut peer, 2).await else {
+                        panic!("expected status response");
+                    };
+                    assert_eq!(status.battery_percentage, Some(73));
+                    loop {
+                        match peer.next().await.unwrap().unwrap() {
+                            Message::Ping(payload) => peer.send(Message::Pong(payload)).await.unwrap(),
+                            Message::Close(_) => break,
+                            other => panic!("expected close, got {other:?}"),
+                        }
+                    }
+                    // Read TCP directly without flushing its queued
+                    // close reply. The relay must close TCP by itself.
+                    let tcp = peer.get_mut();
+                    assert_eq!(tcp.read(&mut [0]).await.unwrap(), 0);
+                },
+            );
+        })
+        .await
+        .expect("withdrawal must finish while the peer withholds its close reply");
+        assert!(service.relays.is_empty());
+        assert!(service.discovered_streamers.is_empty());
+
+        sender
+            .send_to(b"retired-outbound", streamer_port)
+            .await
+            .unwrap();
+        destination
+            .send_to(b"retired-inbound", return_addr)
+            .await
+            .unwrap();
+        let quiet = Duration::from_millis(250);
+        let mut outbound = [0; 32];
+        let mut inbound = [0; 32];
+        let (outbound, inbound, retry) = tokio::join!(
+            timeout(quiet, destination.recv_from(&mut outbound)),
+            timeout(quiet, sender.recv_from(&mut inbound)),
+            timeout(Duration::from_secs(6), listener.accept()),
+        );
+        assert!(
+            outbound.is_err(),
+            "retired outbound tunnel forwarded traffic"
+        );
+        assert!(inbound.is_err(), "retired inbound tunnel forwarded traffic");
+        assert!(retry.is_err(), "retired relay reconnected");
+    }
+
+    #[tokio::test]
+    async fn replacing_or_removing_discovered_url_retires_only_its_relay() {
+        let service = RelayServiceInner::new(
+            RelayServiceConfig {
+                password: String::new(),
+                network_interfaces_to_allow: vec![],
+                network_interfaces_to_ignore: vec![],
+                streamer_urls: vec![],
+                interface_name_overrides: vec![],
+                runtime_status_file: None,
+                database: PathBuf::new(),
+            },
+            None,
+        )
+        .await;
+        let mut service = service.lock().await;
+        // Keep the interface present while reconciling without opening sockets.
+        let address = Ipv4Addr::LOCALHOST;
+        service.network_interfaces = vec![NetworkInterface::new_afinet(
+            "lo", address, None, None, 1, true,
+        )];
+        let fullname = format!("Streamer.{MDNS_SERVICE_TYPE}");
+        let other = format!("Other.{MDNS_SERVICE_TYPE}");
+        let old_url = "ws://192.0.2.1:7777";
+        let new_url = "ws://192.0.2.2:7777";
+        let streamer = |url: &str| Streamer {
+            name: "Shared display name".into(),
+            url: url.into(),
+        };
+        let relay = |url: &str| ServiceRelay {
+            interface_name: "lo".into(),
+            interface_address: address,
+            streamer_name: streamer(url).name,
+            streamer_url: url.into(),
+            relay: Relay::new(),
+        };
+        service
+            .update_discovered_streamer(fullname.clone(), Some(streamer(old_url)))
+            .await;
+        service
+            .update_discovered_streamer(other.clone(), Some(streamer(new_url)))
+            .await;
+        service.relays.push(relay(old_url));
+        service.relays.push(relay(new_url));
+
+        service
+            .update_discovered_streamer(fullname.clone(), Some(streamer(new_url)))
+            .await;
+        assert_eq!(service.discovered_streamers.len(), 2);
+        assert_eq!(service.relays.len(), 1, "the replaced URL was retired");
+        assert_eq!(service.relays[0].streamer_url, new_url);
+
+        service.update_discovered_streamer(other, None).await;
+        assert_eq!(
+            service.relays.len(),
+            1,
+            "the remaining instance still advertises this URL"
+        );
+        service
+            .update_discovered_streamer(fullname.to_ascii_uppercase(), None)
+            .await;
+        assert!(service.discovered_streamers.is_empty());
+        assert!(service.relays.is_empty());
+    }
 
     #[tokio::test]
     async fn a_relay_object_does_not_mean_authenticated() {
@@ -645,8 +934,9 @@ mod runtime_tests {
         assert_eq!(value["connected"], false);
         assert_eq!(value["relays"][0]["connected"], false);
         // Update authentication concurrently with repeated file snapshots.
-        use crate::protocol::{Identified, MessageToRelay, MoblinkResult, Present};
         use futures_util::SinkExt;
+
+        use crate::protocol::{Identified, MessageToRelay, MoblinkResult, Present};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay = &inner.relays[0].relay;
         relay
